@@ -78,6 +78,27 @@ make clean
 └── server/templates/    # HTML templates
 ```
 
+## Updating Vendored Dependencies
+
+The web interface uses vendored copies of HTMX and Tailwind CSS, embedded directly into the binary via Go's `embed` directive.
+
+To update to the latest versions:
+
+```bash
+# Update HTMX
+curl -L -o server/static/vendor/htmx.min.js \
+  https://unpkg.com/htmx.org@latest/dist/htmx.min.js
+
+# Update Tailwind CSS Play CDN
+curl -L -o server/static/vendor/tailwind.min.css \
+  https://cdn.tailwindcss.com
+
+# Rebuild to embed the new versions
+go build -o solitaire ./cmd/solitaire
+```
+
+To pin to a specific version, replace `latest` with the desired version tag (e.g., `2.0.4`).
+
 ## License
 
 MIT

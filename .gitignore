@@ -6,7 +6,6 @@ solitaire-server
 *.exe
 *.test
 *.out
-vendor/
 
 # macOS
 .DS_Store
