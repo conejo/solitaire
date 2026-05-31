@@ -1,0 +1,33 @@
+{{define "card.html"}}
+{{$isSelected := false}}
+{{if .Selected}}
+    {{if and (eq .Selected.PileType .PileType) (eq .Selected.PileIndex .PileIndex) (eq .Selected.CardIndex .CardIndex)}}
+        {{$isSelected = true}}
+    {{end}}
+{{end}}
+
+{{if .Card.FaceUp}}
+<form hx-post="/select" hx-target="#board" class="m-0 p-0">
+    <input type="hidden" name="pile_type" value="{{.PileType}}">
+    <input type="hidden" name="pile_index" value="{{.PileIndex}}">
+    <input type="hidden" name="card_index" value="{{.CardIndex}}">
+    <button type="submit" class="card {{if $isSelected}}ring-4 ring-yellow-400{{end}} {{if .Card.Suit.IsRed}}text-red-600{{else}}text-slate-900{{end}}">
+        <div class="card-face">
+            <div class="card-corner top-left">
+                <span class="card-rank">{{.Card.Rank.String}}{{.Card.Suit.Symbol}}</span>
+            </div>
+            <div class="card-center-suit">{{.Card.Suit.Symbol}}</div>
+            <div class="card-corner bottom-right">
+                <span class="card-rank">{{.Card.Rank.String}}{{.Card.Suit.Symbol}}</span>
+            </div>
+        </div>
+    </button>
+</form>
+{{else}}
+<div class="card card-back">
+    <div class="w-full h-full bg-blue-800 rounded border-2 border-blue-900 flex items-center justify-center">
+        <div class="w-8 h-8 border-2 border-blue-600 rounded-full"></div>
+    </div>
+</div>
+{{end}}
+{{end}}

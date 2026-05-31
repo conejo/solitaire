@@ -1,0 +1,54 @@
+{{define "pile.html"}}
+<div class="relative min-h-[144px]">
+    {{if .Pile.IsEmpty}}
+    <!-- Empty tableau slot -->
+    <form hx-post="/select" hx-target="#board" class="card-slot empty-tableau">
+        <input type="hidden" name="pile_type" value="tableau">
+        <input type="hidden" name="pile_index" value="{{.PileIndex}}">
+        <input type="hidden" name="card_index" value="0">
+        <button type="submit" class="w-full h-full"></button>
+    </form>
+    {{else}}
+    <!-- Pile with cards -->
+    <div class="relative">
+        {{range $j, $card := .Pile.Cards}}
+            {{$isSelected := false}}
+            {{if $.Selected}}
+                {{if and (eq $.Selected.PileType "tableau") (eq $.Selected.PileIndex $.PileIndex) (eq $.Selected.CardIndex $j)}}
+                    {{$isSelected = true}}
+                {{end}}
+            {{end}}
+
+            {{if $card.FaceUp}}
+            <div class="card-container {{if gt $j 0}}card-overlap{{end}}" style="z-index: {{$j}};">
+                <form hx-post="/select" hx-target="#board" class="m-0 p-0">
+                    <input type="hidden" name="pile_type" value="tableau">
+                    <input type="hidden" name="pile_index" value="{{$.PileIndex}}">
+                    <input type="hidden" name="card_index" value="{{$j}}">
+                    <button type="submit" class="card {{if $isSelected}}ring-4 ring-yellow-400{{end}} {{if $card.Suit.IsRed}}text-red-600{{else}}text-slate-900{{end}}">
+                        <div class="card-face">
+                            <div class="card-corner top-left">
+                                <span class="card-rank">{{$card.Rank.String}}{{$card.Suit.Symbol}}</span>
+                            </div>
+                            <div class="card-center-suit">{{$card.Suit.Symbol}}</div>
+                            <div class="card-corner bottom-right">
+                                <span class="card-rank">{{$card.Rank.String}}{{$card.Suit.Symbol}}</span>
+                            </div>
+                        </div>
+                    </button>
+                </form>
+            </div>
+            {{else}}
+            <div class="card-container {{if gt $j 0}}card-overlap{{end}}" style="z-index: {{$j}};">
+                <div class="card card-back">
+                    <div class="w-full h-full bg-blue-800 rounded border-2 border-blue-900 flex items-center justify-center">
+                        <div class="w-8 h-8 border-2 border-blue-600 rounded-full"></div>
+                    </div>
+                </div>
+            </div>
+            {{end}}
+        {{end}}
+    </div>
+    {{end}}
+</div>
+{{end}}

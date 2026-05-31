@@ -1,0 +1,18 @@
+# Binary
+solitaire
+solitaire-server
+
+# Go
+*.exe
+*.test
+*.out
+vendor/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

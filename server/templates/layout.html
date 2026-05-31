@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Solitaire</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <script src="/static/vendor/htmx.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="flex items-center justify-between mb-6">
+            <h1 class="text-3xl font-bold text-white">Solitaire</h1>
+            <div class="flex items-center gap-4">
+                <span class="text-white text-sm">Game: <span class="font-semibold capitalize">{{.GameType}}</span></span>
+                <form hx-post="/new" hx-target="#board" class="m-0 p-0 inline-block">
+                    <button type="submit" class="header-btn header-btn-yellow">
+                        New Game
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Game Board -->
+        <div id="board">
+            {{template "board.html" .}}
+        </div>
+    </div>
+</body>
+</html>

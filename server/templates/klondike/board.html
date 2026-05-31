@@ -1,0 +1,105 @@
+{{define "board.html"}}
+<div id="board" class="space-y-4">
+    {{if .State.IsWon}}
+    <div class="text-center py-8">
+        <h2 class="text-4xl font-bold text-yellow-300 mb-4">🎉 You Win! 🎉</h2>
+        <p class="text-white text-lg">Congratulations! You've completed the game.</p>
+    </div>
+    {{end}}
+
+    {{if .State.Error}}
+    <div class="error-message">
+        {{.State.Error}}
+    </div>
+    {{end}}
+
+    <!-- Controls -->
+    <div class="flex items-center gap-4 mb-4">
+        <form hx-post="/draw-mode" hx-target="#board" class="m-0 p-0 inline-block">
+            <button type="submit" class="header-btn header-btn-blue text-sm">
+                Toggle Draw ({{if eq .State.DrawCount 3}}3{{else}}1{{end}})
+            </button>
+        </form>
+        <form hx-post="/toggle-one-click" hx-target="#board" class="m-0 p-0 inline-block">
+            <button type="submit" class="header-btn {{if .State.OneClickMove}}header-btn-green{{else}}header-btn-gray{{end}} text-sm">
+                1-Click: {{if .State.OneClickMove}}On{{else}}Off{{end}}
+            </button>
+        </form>
+        <form hx-post="/foundation-auto" hx-target="#board" class="m-0 p-0 inline-block">
+            <button type="submit" class="header-btn header-btn-yellow text-sm">
+                Auto to Foundation
+            </button>
+        </form>
+    </div>
+
+    <!-- Top Row: Stock, Waste, Foundations -->
+    <div class="flex justify-between items-start">
+        <!-- Stock and Waste -->
+        <div class="flex gap-2">
+            <!-- Stock -->
+            <div class="relative">
+                <form hx-post="/stock" hx-target="#board" class="m-0 p-0">
+                    <button type="submit" class="card-slot {{if .State.Stock.IsEmpty}}empty-slot{{else}}card-back{{end}}">
+                        {{if .State.Stock.IsEmpty}}
+                        <span class="text-gray-400 text-xs">↻</span>
+                        {{end}}
+                    </button>
+                </form>
+                {{if not .State.Stock.IsEmpty}}
+                <div class="stock-badge">
+                    {{.State.Stock.Size}}
+                </div>
+                {{end}}
+            </div>
+
+            <!-- Waste -->
+            <div class="card-slot waste-pile">
+                {{if not .State.Waste.IsEmpty}}
+                    {{$wasteSize := .State.Waste.Size}}
+                    {{$displayCount := 3}}
+                    {{if lt $wasteSize 3}}{{$displayCount = $wasteSize}}{{end}}
+                    {{$startIndex := sub $wasteSize $displayCount}}
+                    {{range $k, $_ := until $displayCount}}
+                        {{$cardIndex := add $startIndex $k}}
+                        {{$card := index $.State.Waste.Cards $cardIndex}}
+                        {{$offset := mul $k 28}}
+                        <div class="waste-card" style="left: {{$offset}}px;">
+                            {{template "card.html" (dict "Card" $card "PileType" "waste" "PileIndex" 0 "CardIndex" $cardIndex "Selected" $.State.Selected)}}
+                        </div>
+                    {{end}}
+                {{end}}
+            </div>
+        </div>
+
+        <!-- Foundations -->
+        <div class="flex gap-2">
+            {{range $i, $foundation := .State.Foundation}}
+            <div class="card-slot {{if $foundation.IsEmpty}}empty-foundation{{end}}">
+                {{if not $foundation.IsEmpty}}
+                    {{$topCard := index $foundation.Cards (sub $foundation.Size 1)}}
+                    {{template "card.html" (dict "Card" $topCard "PileType" "foundation" "PileIndex" $i "CardIndex" (sub $foundation.Size 1) "Selected" $.State.Selected)}}
+                {{else}}
+                <form hx-post="/select" hx-target="#board" class="w-full h-full m-0 p-0">
+                    <input type="hidden" name="pile_type" value="foundation">
+                    <input type="hidden" name="pile_index" value="{{$i}}">
+                    <input type="hidden" name="card_index" value="0">
+                    <button type="submit" class="w-full h-full flex items-center justify-center">
+                        <span class="text-gray-400 text-2xl">♠♥♦♣</span>
+                    </button>
+                </form>
+                {{end}}
+            </div>
+            {{end}}
+        </div>
+    </div>
+
+    <!-- Tableau -->
+    <div class="flex justify-between gap-2 mt-8">
+        {{range $i, $pile := .State.Tableau}}
+        <div class="flex-1 min-w-0">
+            {{template "pile.html" (dict "Pile" $pile "PileIndex" $i "Selected" $.State.Selected)}}
+        </div>
+        {{end}}
+    </div>
+</div>
+{{end}}
