@@ -5,21 +5,35 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"sync"
 
+	"github.com/solitaire/engine"
 	"go.uber.org/zap"
 )
 
 // Server holds the HTTP server configuration and game state.
+//
+// Games is guarded by mu: a read-lock is enough to look up an existing
+// session, but writes (insert, replace) require the write lock. The map
+// stores *GameSession pointers (not values) so that GameSession.mu is
+// shared by all holders of the pointer — copying a sync.Mutex is a vet
+// error and would silently corrupt the lock state.
 type Server struct {
 	Templates *template.Template
-	Games     map[string]GameSession
 	Logger    *zap.Logger
+
+	mu    sync.RWMutex
+	Games map[string]*GameSession
 }
 
-// GameSession holds a game instance and its type.
+// GameSession holds a game instance and its type. The mutex serializes
+// mutations of Game — without it, two concurrent HTMX requests on the same
+// session could interleave calls like MoveTo + DrawFromStock and corrupt
+// internal state. Always access via *GameSession so the mutex is shared.
 type GameSession struct {
-	Game     interface{}
+	Game     engine.Game
 	GameType string
+	mu       sync.Mutex
 }
 
 // NewServer creates a new server with parsed templates.
@@ -31,7 +45,7 @@ func NewServer(logger *zap.Logger) (*Server, error) {
 
 	return &Server{
 		Templates: tmpl,
-		Games:     make(map[string]GameSession),
+		Games:     make(map[string]*GameSession),
 		Logger:    logger,
 	}, nil
 }
@@ -88,12 +102,25 @@ func parseTemplates() (*template.Template, error) {
 
 // Start starts the HTTP server on the given address.
 func (s *Server) Start(addr string) error {
+	s.Logger.Info("starting server", zap.String("addr", addr))
+	return http.ListenAndServe(addr, s.Handler())
+}
+
+// Handler returns the HTTP handler for the server. Exposed so tests can
+// drive routes via httptest without binding a real socket.
+func (s *Server) Handler() http.Handler {
+	return s.buildMux()
+}
+
+func (s *Server) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Static files
 	staticSub, err := fs.Sub(staticFS, "static")
 	if err != nil {
-		return err
+		// The embedded FS is always present at compile time; if it's
+		// missing something is very wrong, so panic rather than swallow.
+		panic("server: missing embedded static FS: " + err.Error())
 	}
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticSub))))
 
@@ -106,6 +133,5 @@ func (s *Server) Start(addr string) error {
 	mux.HandleFunc("POST /draw-mode", s.handleDrawMode)
 	mux.HandleFunc("POST /toggle-one-click", s.handleToggleOneClick)
 
-	s.Logger.Info("starting server", zap.String("addr", addr))
-	return http.ListenAndServe(addr, mux)
+	return mux
 }

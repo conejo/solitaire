@@ -38,14 +38,25 @@ func setSessionCookie(w http.ResponseWriter, sessionID string) {
 }
 
 // getOrCreateGame retrieves or creates a game for the session.
-func (s *Server) getOrCreateGame(sessionID string, gameType string) engine.Game {
-	if gs, ok := s.Games[sessionID]; ok {
-		if g, ok := gs.Game.(engine.Game); ok {
-			return g
-		}
+//
+// Two locks are involved:
+//  1. s.mu (read or write) protects the s.Games map itself.
+//  2. The returned *GameSession's mu serializes mutations of the underlying
+//     engine.Game, which is not safe for concurrent use. Callers must hold
+//     that lock for the duration of any game-mutating call they make.
+//
+// The map stores *GameSession (not GameSession) so the per-session mutex is
+// shared by all holders of the pointer — copying a sync.Mutex would be
+// undefined behavior.
+func (s *Server) getOrCreateGame(sessionID string, gameType string) (*GameSession, error) {
+	s.mu.RLock()
+	gs, ok := s.Games[sessionID]
+	s.mu.RUnlock()
+	if ok {
+		return gs, nil
 	}
 
-	// Create new game
+	// Create new game outside the lock to keep the critical section short.
 	var game engine.Game
 	switch gameType {
 	case "klondike":
@@ -54,9 +65,21 @@ func (s *Server) getOrCreateGame(sessionID string, gameType string) engine.Game 
 		game = klondike.NewKlondikeGame(3)
 	}
 
-	game.NewGame()
-	s.Games[sessionID] = GameSession{Game: game, GameType: gameType}
-	return game
+	if err := game.NewGame(); err != nil {
+		return nil, err
+	}
+
+	newSession := &GameSession{Game: game, GameType: gameType}
+	s.mu.Lock()
+	// Re-check in case another goroutine created the same session while we
+	// were dealing.
+	if existing, ok := s.Games[sessionID]; ok {
+		s.mu.Unlock()
+		return existing, nil
+	}
+	s.Games[sessionID] = newSession
+	s.mu.Unlock()
+	return newSession, nil
 }
 
 // handleIndex renders the main game page.
@@ -70,8 +93,16 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		gameType = "klondike"
 	}
 
-	game := s.getOrCreateGame(sessionID, gameType)
-	state := game.GetState()
+	gs, err := s.getOrCreateGame(sessionID, gameType)
+	if err != nil {
+		s.Logger.Error("failed to create game", zap.Error(err), zap.String("session_id", sessionID))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	gs.mu.Lock()
+	state := gs.Game.GetState()
+	gs.mu.Unlock()
 
 	data := struct {
 		State    engine.GameState
@@ -116,10 +147,21 @@ func (s *Server) handleNewGame(w http.ResponseWriter, r *http.Request) {
 		game = klondike.NewKlondikeGame(3)
 	}
 
-	game.NewGame()
-	s.Games[sessionID] = GameSession{Game: game, GameType: gameType}
+	if err := game.NewGame(); err != nil {
+		s.Logger.Error("failed to start new game", zap.Error(err), zap.String("session_id", sessionID))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-	state := game.GetState()
+	gs := &GameSession{Game: game, GameType: gameType}
+	s.mu.Lock()
+	s.Games[sessionID] = gs
+	s.mu.Unlock()
+
+	gs.mu.Lock()
+	state := gs.Game.GetState()
+	gs.mu.Unlock()
+
 	data := struct {
 		State    engine.GameState
 		GameType string
@@ -146,13 +188,21 @@ func (s *Server) handleNewGame(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSelect(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sessionID := getSessionID(r)
-	game := s.getOrCreateGame(sessionID, "")
+	gs, err := s.getOrCreateGame(sessionID, "")
+	if err != nil {
+		s.Logger.Error("failed to get game", zap.Error(err), zap.String("session_id", sessionID))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	game := gs.Game
 
 	// Parse form data
 	if err := r.ParseForm(); err != nil {
 		s.Logger.Warn("failed to parse form", zap.Error(err), zap.String("session_id", sessionID))
+		gs.mu.Lock()
 		state := game.GetState()
 		state.Error = "failed to parse form"
+		gs.mu.Unlock()
 		renderBoard(w, s.Templates, state, "klondike")
 		return
 	}
@@ -166,6 +216,7 @@ func (s *Server) handleSelect(w http.ResponseWriter, r *http.Request) {
 	fmt.Sscanf(pileIndexStr, "%d", &pileIndex)
 	fmt.Sscanf(cardIndexStr, "%d", &cardIndex)
 
+	gs.mu.Lock()
 	// If no selection exists, try to select
 	if game.GetSelection() == nil {
 		err := game.Select(pileType, pileIndex, cardIndex)
@@ -179,6 +230,7 @@ func (s *Server) handleSelect(w http.ResponseWriter, r *http.Request) {
 			)
 			state := game.GetState()
 			state.Error = err.Error()
+			gs.mu.Unlock()
 			renderBoard(w, s.Templates, state, "klondike")
 			return
 		}
@@ -194,12 +246,16 @@ func (s *Server) handleSelect(w http.ResponseWriter, r *http.Request) {
 			)
 			state := game.GetState()
 			state.Error = err.Error()
+			gs.mu.Unlock()
 			renderBoard(w, s.Templates, state, "klondike")
 			return
 		}
 	}
 
 	state := game.GetState()
+	hasSelection := game.GetSelection() != nil
+	gs.mu.Unlock()
+
 	renderBoard(w, s.Templates, state, "klondike")
 
 	s.Logger.Info("select/move",
@@ -207,7 +263,7 @@ func (s *Server) handleSelect(w http.ResponseWriter, r *http.Request) {
 		zap.String("pile_type", pileType),
 		zap.Int("pile_index", pileIndex),
 		zap.Int("card_index", cardIndex),
-		zap.Bool("has_selection", game.GetSelection() != nil),
+		zap.Bool("has_selection", hasSelection),
 		zap.Duration("duration", time.Since(start)),
 	)
 }
@@ -216,18 +272,27 @@ func (s *Server) handleSelect(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStock(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sessionID := getSessionID(r)
-	game := s.getOrCreateGame(sessionID, "")
+	gs, err := s.getOrCreateGame(sessionID, "")
+	if err != nil {
+		s.Logger.Error("failed to get game", zap.Error(err), zap.String("session_id", sessionID))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	game := gs.Game
 
-	err := game.DrawFromStock()
+	gs.mu.Lock()
+	err = game.DrawFromStock()
 	if err != nil {
 		s.Logger.Warn("draw from stock failed", zap.Error(err), zap.String("session_id", sessionID))
 		state := game.GetState()
 		state.Error = err.Error()
+		gs.mu.Unlock()
 		renderBoard(w, s.Templates, state, "klondike")
 		return
 	}
-
 	state := game.GetState()
+	gs.mu.Unlock()
+
 	renderBoard(w, s.Templates, state, "klondike")
 
 	s.Logger.Info("draw from stock",
@@ -240,11 +305,19 @@ func (s *Server) handleStock(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleFoundationAuto(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sessionID := getSessionID(r)
-	game := s.getOrCreateGame(sessionID, "")
+	gs, err := s.getOrCreateGame(sessionID, "")
+	if err != nil {
+		s.Logger.Error("failed to get game", zap.Error(err), zap.String("session_id", sessionID))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	game := gs.Game
 
+	gs.mu.Lock()
 	game.AutoMoveToFoundation()
-
 	state := game.GetState()
+	gs.mu.Unlock()
+
 	renderBoard(w, s.Templates, state, "klondike")
 
 	s.Logger.Info("auto move to foundation",
@@ -257,16 +330,24 @@ func (s *Server) handleFoundationAuto(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDrawMode(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sessionID := getSessionID(r)
-	game := s.getOrCreateGame(sessionID, "")
+	gs, err := s.getOrCreateGame(sessionID, "")
+	if err != nil {
+		s.Logger.Error("failed to get game", zap.Error(err), zap.String("session_id", sessionID))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	game := gs.Game
 
+	gs.mu.Lock()
 	currentDraw := game.GetDrawCount()
 	newDraw := 3
 	if currentDraw == 3 {
 		newDraw = 1
 	}
 	game.SetDrawCount(newDraw)
-
 	state := game.GetState()
+	gs.mu.Unlock()
+
 	renderBoard(w, s.Templates, state, "klondike")
 
 	s.Logger.Info("toggle draw mode",
@@ -281,16 +362,25 @@ func (s *Server) handleDrawMode(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleToggleOneClick(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sessionID := getSessionID(r)
-	game := s.getOrCreateGame(sessionID, "")
+	gs, err := s.getOrCreateGame(sessionID, "")
+	if err != nil {
+		s.Logger.Error("failed to get game", zap.Error(err), zap.String("session_id", sessionID))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	game := gs.Game
 
+	gs.mu.Lock()
 	game.ToggleOneClickMove()
-
 	state := game.GetState()
+	oneClick := state.OneClickMove
+	gs.mu.Unlock()
+
 	renderBoard(w, s.Templates, state, "klondike")
 
 	s.Logger.Info("toggle one-click move",
 		zap.String("session_id", sessionID),
-		zap.Bool("one_click_move", game.GetState().OneClickMove),
+		zap.Bool("one_click_move", oneClick),
 		zap.Duration("duration", time.Since(start)),
 	)
 }

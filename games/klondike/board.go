@@ -379,9 +379,24 @@ func (g *KlondikeGame) AutoMoveToFoundation() error {
 	return nil
 }
 
-// saveState pushes a copy of the current state onto the history stack.
+// saveState pushes a deep copy of the current state onto the history stack.
+// We must deep-copy the underlying Card slices: the GameState value-copy only
+// copies the slice headers, so subsequent mutations (e.g. AddCards via append)
+// would otherwise overwrite the snapshot's backing array and corrupt Undo.
 func (g *KlondikeGame) saveState() {
 	state := g.GetState()
+	for i := range state.Tableau {
+		state.Tableau[i].Cards = append([]engine.Card(nil), g.Tableau[i].Cards...)
+	}
+	for i := range state.Foundation {
+		state.Foundation[i].Cards = append([]engine.Card(nil), g.Foundation[i].Cards...)
+	}
+	state.Stock.Cards = append([]engine.Card(nil), g.Stock.Cards...)
+	state.Waste.Cards = append([]engine.Card(nil), g.Waste.Cards...)
+	// Cards in a Selection also share the source pile's backing array.
+	if state.Selected != nil {
+		state.Selected.Cards = append([]engine.Card(nil), state.Selected.Cards...)
+	}
 	g.history = append(g.history, state)
 	// Limit history to 100 moves
 	if len(g.history) > 100 {

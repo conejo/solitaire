@@ -622,3 +622,114 @@ func TestGetSelection(t *testing.T) {
 		t.Error("GetSelection should return selection after Select")
 	}
 }
+
+// TestUndoDeepCopyTableau verifies that the undo history deep-copies pile
+// slices. Previously saveState() relied on Go's value-copy of GameState, but
+// [N]Pile contains []Card slices whose backing arrays were shared with the
+// live game. Subsequent mutations (e.g. AddCards via append) could overwrite
+// the snapshot, so Undo would restore corrupted state. This test exercises
+// that exact path: make a move, then mutate the destination pile, then undo
+// and assert the restored state matches the pre-move state.
+func TestUndoDeepCopyTableau(t *testing.T) {
+	g := NewKlondikeGame(1).(*KlondikeGame)
+	g.OneClickMove = false
+
+	// Tableau 0: [5♣] face-up (target)
+	g.Tableau[0] = engine.Pile{}
+	g.Tableau[0].Push(engine.Card{Suit: engine.Clubs, Rank: engine.Five, FaceUp: true})
+
+	// Tableau 1: [4♦, 3♣] face-up (valid alt-color sequence to move).
+	g.Tableau[1] = engine.Pile{}
+	g.Tableau[1].Push(engine.Card{Suit: engine.Diamonds, Rank: engine.Four, FaceUp: true})
+	g.Tableau[1].Push(engine.Card{Suit: engine.Clubs, Rank: engine.Three, FaceUp: true})
+
+	// Move 4♦-3♣ from pile 1 onto 5♣. saveState() runs first.
+	g.Select("tableau", 1, 0)
+	if err := g.MoveTo("tableau", 0); err != nil {
+		t.Fatalf("MoveTo(tableau, 0) failed: %v", err)
+	}
+	if !g.Tableau[1].IsEmpty() {
+		t.Fatalf("after move, pile 1 should be empty")
+	}
+
+	// Push two NEW cards onto pile 1. The slice will reuse its existing
+	// backing array (capacity >= 2) and overwrite indices 0 and 1 — the
+	// exact slots the snapshot still points at. With the shallow-copy bug,
+	// Undo will then read these new cards instead of the originals.
+	g.Tableau[1].Push(engine.Card{Suit: engine.Spades, Rank: engine.Queen, FaceUp: true})
+	g.Tableau[1].Push(engine.Card{Suit: engine.Hearts, Rank: engine.Jack, FaceUp: true})
+
+	// Undo: pile 1 should be restored to [4♦, 3♣], not [Q♠, J♥].
+	if err := g.Undo(); err != nil {
+		t.Fatalf("Undo() failed: %v", err)
+	}
+	if g.Tableau[1].Size() != 2 {
+		t.Fatalf("after undo, pile 1 size = %d, want 2", g.Tableau[1].Size())
+	}
+	want := []engine.Card{
+		{Suit: engine.Diamonds, Rank: engine.Four, FaceUp: true},
+		{Suit: engine.Clubs, Rank: engine.Three, FaceUp: true},
+	}
+	for i, c := range want {
+		got, _ := g.Tableau[1].CardAt(i)
+		if got.Suit != c.Suit || got.Rank != c.Rank || got.FaceUp != c.FaceUp {
+			t.Errorf("pile 1 card %d after undo = %s%s faceUp=%v, want %s%s faceUp=%v",
+				i, got.Rank, got.Suit, got.FaceUp, c.Rank, c.Suit, c.FaceUp)
+		}
+	}
+}
+
+// TestUndoDeepCopySelection verifies that the cards in a Selection are
+// deep-copied. In Select(), the Selection.Cards slice is a sub-slice of the
+// source pile's backing array, so a later mutation of the pile would
+// otherwise corrupt the saved Selection.
+func TestUndoDeepCopySelection(t *testing.T) {
+	g := NewKlondikeGame(1).(*KlondikeGame)
+	g.OneClickMove = false
+
+	// Tableau 0: [5♣] face-up
+	g.Tableau[0] = engine.Pile{}
+	g.Tableau[0].Push(engine.Card{Suit: engine.Clubs, Rank: engine.Five, FaceUp: true})
+
+	// Tableau 1: [4♦, 3♣] face-up. After Select("tableau", 1, 0), the
+	// Selection.Cards will be a sub-slice of pile 1's backing array
+	// starting at index 0.
+	g.Tableau[1] = engine.Pile{}
+	g.Tableau[1].Push(engine.Card{Suit: engine.Diamonds, Rank: engine.Four, FaceUp: true})
+	g.Tableau[1].Push(engine.Card{Suit: engine.Clubs, Rank: engine.Three, FaceUp: true})
+
+	g.Select("tableau", 1, 0)
+	if g.Selected == nil {
+		t.Fatal("expected selection")
+	}
+	wantSel := append([]engine.Card(nil), g.Selected.Cards...)
+
+	// Move to pile 0. saveState() ran first and (with the bug) captured a
+	// Selection whose Cards share the backing array with pile 1.
+	if err := g.MoveTo("tableau", 0); err != nil {
+		t.Fatalf("MoveTo(tableau, 0) failed: %v", err)
+	}
+
+	// Now overwrite the source pile's backing array. Push a card onto pile
+	// 1 — since capacity is still >= 2, the append will reuse the existing
+	// array, overwriting index 0. (Index 1 may or may not be touched, but
+	// the snapshot's Selection.Cards[0] would now read the new card.)
+	g.Tableau[1].Push(engine.Card{Suit: engine.Spades, Rank: engine.Queen, FaceUp: true})
+
+	// Undo: the restored Selection should still hold the original 4♦.
+	if err := g.Undo(); err != nil {
+		t.Fatalf("Undo() failed: %v", err)
+	}
+	sel := g.GetSelection()
+	if sel == nil {
+		t.Fatal("expected restored selection after Undo")
+	}
+	if len(sel.Cards) != len(wantSel) {
+		t.Fatalf("after undo, sel cards = %d, want %d", len(sel.Cards), len(wantSel))
+	}
+	if sel.Cards[0] != wantSel[0] {
+		t.Errorf("sel.Cards[0] = %s%s, want %s%s",
+			sel.Cards[0].Rank, sel.Cards[0].Suit,
+			wantSel[0].Rank, wantSel[0].Suit)
+	}
+}
