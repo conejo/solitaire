@@ -1,11 +1,16 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"html/template"
 	"io/fs"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/solitaire/engine"
 	"go.uber.org/zap"
@@ -19,8 +24,9 @@ import (
 // shared by all holders of the pointer — copying a sync.Mutex is a vet
 // error and would silently corrupt the lock state.
 type Server struct {
-	Templates *template.Template
-	Logger    *zap.Logger
+	Templates    *template.Template
+	Logger       *zap.Logger
+	CookieSecure bool // force Secure flag on session cookies
 
 	mu    sync.RWMutex
 	Games map[string]*GameSession
@@ -100,10 +106,78 @@ func parseTemplates() (*template.Template, error) {
 	return tmpl, nil
 }
 
-// Start starts the HTTP server on the given address.
+// Server timeouts. The Go DefaultServer has no timeouts at all, which
+// lets a single slow client hold a connection (and an FD) open forever.
+// These values are conservative for a local game; production deployments
+// behind a reverse proxy can shorten them further.
+const (
+	serverReadHeaderTimeout = 5 * time.Second
+	serverReadTimeout       = 15 * time.Second
+	serverWriteTimeout      = 30 * time.Second
+	serverIdleTimeout       = 120 * time.Second
+	serverShutdownTimeout   = 10 * time.Second
+)
+
+// Start creates an http.Server with sensible timeouts and blocks until
+// the server stops. On a normal SIGINT/SIGTERM, it returns nil. On a
+// listener failure, it returns the underlying error. The shutdown timeout
+// bounds how long Start waits for in-flight requests to complete.
 func (s *Server) Start(addr string) error {
-	s.Logger.Info("starting server", zap.String("addr", addr))
-	return http.ListenAndServe(addr, s.Handler())
+	srv := s.httpServer(addr)
+	s.Logger.Info("starting server",
+		zap.String("addr", addr),
+		zap.Duration("read_header_timeout", serverReadHeaderTimeout),
+		zap.Duration("write_timeout", serverWriteTimeout),
+	)
+
+	// Run ListenAndServe in a goroutine so we can race it against the
+	// shutdown signal handler.
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+		}
+		close(errCh)
+	}()
+
+	// Wait for SIGINT/SIGTERM. signal.Notify with no Notify channel
+	// argument would use a default channel; we explicitly make one so
+	// the deferred Stop() releases resources.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigCh:
+		s.Logger.Info("shutdown signal received", zap.String("signal", sig.String()))
+	case err, ok := <-errCh:
+		if ok && err != nil {
+			return err
+		}
+		// Server stopped on its own.
+		return nil
+	}
+
+	// Graceful shutdown: bound the time we wait for in-flight requests.
+	ctx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		s.Logger.Error("graceful shutdown failed", zap.Error(err))
+		return err
+	}
+	s.Logger.Info("server stopped cleanly")
+	return nil
+}
+
+// httpServer builds an *http.Server with the timeouts configured above.
+func (s *Server) httpServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
+	}
 }
 
 // Handler returns the HTTP handler for the server. Exposed so tests can

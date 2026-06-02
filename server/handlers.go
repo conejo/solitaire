@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"html/template"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/solitaire/engine"
@@ -13,28 +15,66 @@ import (
 	"go.uber.org/zap"
 )
 
+// sessionCookieName is the name of the session cookie. Centralized so it's
+// easy to grep and to change in one place.
+const sessionCookieName = "session_id"
+
+// sessionCookieMaxAge is how long a session cookie lives. 24 hours is a
+// pragmatic default; longer-lived cookies would need a server-side
+// eviction policy to keep the in-memory game map bounded.
+const sessionCookieMaxAge = 24 * time.Hour
+
 // getSessionID extracts or creates a session ID from the request.
 func getSessionID(r *http.Request) string {
-	cookie, err := r.Cookie("session_id")
+	cookie, err := r.Cookie(sessionCookieName)
 	if err == nil && cookie.Value != "" {
 		return cookie.Value
 	}
-	// Generate a new random session ID
+	// Generate a new random session ID.
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		// Fallback to timestamp-based ID if crypto/rand fails
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+		// crypto/rand failing is exceptional; surface it via a timestamp
+		// fallback so the request still works but it's predictable.
+		// Callers should log this; the function can't log itself without
+		// access to a logger.
+		return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
 }
 
-// setSessionCookie sets the session ID cookie on the response.
-func setSessionCookie(w http.ResponseWriter, sessionID string) {
+// setSessionCookie sets the session ID cookie on the response. The cookie
+// is HttpOnly (not readable from JS — mitigates XSS theft) and SameSite=Lax
+// (mitigates CSRF on the state-changing POST routes). Secure is enabled
+// when the request scheme is https, or can be forced on via CookieOptions
+// for proxied deployments.
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, sessionID string) {
+	secure := s.CookieSecure
+	if !secure && isHTTPSRequest(r) {
+		// Trust the X-Forwarded-Proto header from a properly configured
+		// reverse proxy. If you're not behind one, this stays false.
+		secure = true
+	}
 	http.SetCookie(w, &http.Cookie{
-		Name:  "session_id",
-		Value: sessionID,
-		Path:  "/",
+		Name:     sessionCookieName,
+		Value:    sessionID,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(sessionCookieMaxAge.Seconds()),
 	})
+}
+
+// isHTTPSRequest reports whether the request came in over TLS — either
+// directly (r.TLS != nil) or via a trusted reverse proxy (X-Forwarded-Proto).
+func isHTTPSRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); strings.EqualFold(proto, "https") {
+		return true
+	}
+	return false
 }
 
 // getOrCreateGame retrieves or creates a game for the session.
@@ -86,7 +126,7 @@ func (s *Server) getOrCreateGame(sessionID string, gameType string) (*GameSessio
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sessionID := getSessionID(r)
-	setSessionCookie(w, sessionID)
+	s.setSessionCookie(w, r, sessionID)
 
 	gameType := r.URL.Query().Get("game")
 	if gameType == "" {
@@ -112,12 +152,18 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		GameType: gameType,
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.Templates.ExecuteTemplate(w, "layout.html", data); err != nil {
+	// Render to a buffer first so a template error doesn't trigger
+	// http.Error's WriteHeader after we've already implicitly sent 200
+	// (which produces a "superfluous response.WriteHeader call" warning).
+	var buf bytes.Buffer
+	if err := s.Templates.ExecuteTemplate(&buf, "layout.html", data); err != nil {
 		s.Logger.Error("failed to render index", zap.Error(err), zap.String("session_id", sessionID))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = buf.WriteTo(w)
 
 	s.Logger.Info("request",
 		zap.String("method", r.Method),
@@ -131,7 +177,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNewGame(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sessionID := getSessionID(r)
-	setSessionCookie(w, sessionID)
+	s.setSessionCookie(w, r, sessionID)
 
 	gameType := r.PostFormValue("game_type")
 	if gameType == "" {
@@ -170,12 +216,17 @@ func (s *Server) handleNewGame(w http.ResponseWriter, r *http.Request) {
 		GameType: gameType,
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.Templates.ExecuteTemplate(w, "board.html", data); err != nil {
+	// Buffer first, then commit (avoids "superfluous WriteHeader" if
+	// the template fails after we've already set headers).
+	var buf bytes.Buffer
+	if err := s.Templates.ExecuteTemplate(&buf, "board.html", data); err != nil {
 		s.Logger.Error("failed to render board", zap.Error(err), zap.String("session_id", sessionID))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = buf.WriteTo(w)
 
 	s.Logger.Info("new game",
 		zap.String("session_id", sessionID),
@@ -385,7 +436,9 @@ func (s *Server) handleToggleOneClick(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// renderBoard renders the board template with the given state.
+// renderBoard renders the board template with the given state. Renders to
+// a buffer first so a template error doesn't fire http.Error's WriteHeader
+// after we've already committed the 200 OK (superfluous WriteHeader).
 func renderBoard(w http.ResponseWriter, tmpl *template.Template, state engine.GameState, gameType string) {
 	data := struct {
 		State    engine.GameState
@@ -395,8 +448,12 @@ func renderBoard(w http.ResponseWriter, tmpl *template.Template, state engine.Ga
 		GameType: gameType,
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := tmpl.ExecuteTemplate(w, "board.html", data); err != nil {
+	var buf bytes.Buffer
+	if err := tmpl.ExecuteTemplate(&buf, "board.html", data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = buf.WriteTo(w)
 }

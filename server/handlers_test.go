@@ -141,3 +141,190 @@ func TestStaticFilesServed(t *testing.T) {
 
 // silence unused import warning on platforms where net/http isn't otherwise used.
 var _ = http.MethodGet
+
+// TestSessionCookieHasSecurityFlags verifies that the session cookie set
+// on the first response carries HttpOnly, SameSite=Lax, a non-zero MaxAge,
+// and Path=/. Secure is opt-in (off by default) so a developer can use
+// the cookie over plain HTTP locally.
+func TestSessionCookieHasSecurityFlags(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	resp, err := ts.Client().Get(ts.URL + "/")
+	if err != nil {
+		t.Fatalf("GET / failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var found *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "session_id" {
+			found = c
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("session_id cookie not set")
+	}
+	if !found.HttpOnly {
+		t.Error("cookie HttpOnly = false, want true")
+	}
+	if found.SameSite != http.SameSiteLaxMode {
+		t.Errorf("cookie SameSite = %v, want Lax", found.SameSite)
+	}
+	if found.Path != "/" {
+		t.Errorf("cookie Path = %q, want /", found.Path)
+	}
+	if found.MaxAge <= 0 {
+		t.Errorf("cookie MaxAge = %d, want > 0", found.MaxAge)
+	}
+	if found.Secure {
+		t.Error("cookie Secure = true over plain HTTP, want false (default)")
+	}
+	if found.Value == "" {
+		t.Error("cookie value is empty")
+	}
+}
+
+// TestSessionCookieSecureWhenForced verifies the CookieSecure knob on
+// Server takes effect: when set, every response cookie has Secure=true.
+func TestSessionCookieSecureWhenForced(t *testing.T) {
+	s := newTestServer(t)
+	s.CookieSecure = true
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	resp, err := ts.Client().Get(ts.URL + "/")
+	if err != nil {
+		t.Fatalf("GET / failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var found *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "session_id" {
+			found = c
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("session_id cookie not set")
+	}
+	if !found.Secure {
+		t.Error("CookieSecure=true but cookie.Secure = false")
+	}
+}
+
+// TestSessionCookieSecureBehindProxy verifies that a request with
+// X-Forwarded-Proto: https gets a Secure cookie even when the knob is
+// off. This lets deployments behind a TLS-terminating reverse proxy
+// (nginx, Caddy, ELB) "just work" without a config flag.
+func TestSessionCookieSecureBehindProxy(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	req, err := http.NewRequest("GET", ts.URL+"/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Forwarded-Proto", "https")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET / failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	for _, c := range resp.Cookies() {
+		if c.Name == "session_id" {
+			if !c.Secure {
+				t.Error("X-Forwarded-Proto=https but cookie.Secure = false")
+			}
+			return
+		}
+	}
+	t.Fatal("session_id cookie not set")
+}
+
+// TestSessionCookieNotLeakableByJS is a structural assertion: HttpOnly
+// is set. This is the property the rest of the test suite relies on;
+// it deserves a test of its own so a future "make cookies readable from
+// JS" change fails loud.
+func TestSessionCookieNotLeakableByJS(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	resp, err := ts.Client().Get(ts.URL + "/")
+	if err != nil {
+		t.Fatalf("GET / failed: %v", err)
+	}
+	defer resp.Body.Close()
+	for _, c := range resp.Cookies() {
+		if c.Name == "session_id" && !c.HttpOnly {
+			t.Fatalf("session_id cookie is readable from JavaScript; " +
+				"this allows XSS to steal sessions. Set HttpOnly=true.")
+		}
+	}
+}
+
+// TestSessionIDSticky verifies the same session ID is reused on a
+// subsequent request, so the cookie is doing its job of stabilizing the
+// session.
+func TestSessionIDSticky(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	// First request — cookie should be set.
+	resp1, err := ts.Client().Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp1.Body.Close()
+	var first string
+	for _, c := range resp1.Cookies() {
+		if c.Name == "session_id" {
+			first = c.Value
+		}
+	}
+	if first == "" {
+		t.Fatal("first response had no session_id cookie")
+	}
+
+	// Second request — the client should echo the cookie back, and the
+	// server should NOT issue a new one.
+	req, _ := http.NewRequest("GET", ts.URL+"/", nil)
+	req.AddCookie(&http.Cookie{Name: "session_id", Value: first})
+	resp2, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	for _, c := range resp2.Cookies() {
+		if c.Name == "session_id" && c.Value != first {
+			t.Errorf("session_id changed between requests: %q -> %q", first, c.Value)
+		}
+	}
+}
+
+// TestHttpServerHasTimeouts verifies that the *http.Server built by
+// httpServer has non-zero timeouts on every field. Without these, slow
+// clients can exhaust file descriptors (the "Slowloris" attack).
+func TestHttpServerHasTimeouts(t *testing.T) {
+	s := newTestServer(t)
+	srv := s.httpServer(":0")
+	if srv.ReadHeaderTimeout <= 0 {
+		t.Error("ReadHeaderTimeout not set")
+	}
+	if srv.ReadTimeout <= 0 {
+		t.Error("ReadTimeout not set")
+	}
+	if srv.WriteTimeout <= 0 {
+		t.Error("WriteTimeout not set")
+	}
+	if srv.IdleTimeout <= 0 {
+		t.Error("IdleTimeout not set")
+	}
+}
